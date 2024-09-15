@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 using System.Net.Http;
 using System.Threading.Tasks;
+using System.Collections.Generic;
 using HtmlAgilityPack;
 
 namespace LegalApiProxy.Controllers
@@ -20,44 +21,61 @@ namespace LegalApiProxy.Controllers
         }
 
         [HttpGet("documents")]
-        public async Task<IActionResult> GetDocuments()
+        public async Task<IActionResult> GetDocuments([FromQuery] List<string> urls)
         {
-            string externalApiUrl = "https://www.courtlistener.com/api/rest/v3/documents/";
-
-            _logger.LogInformation("Sending request to {ExternalApiUrl}", externalApiUrl);
-
-            var request = new HttpRequestMessage(HttpMethod.Get, externalApiUrl);
-            request.Headers.Add("Authorization", $"Token {Environment.GetEnvironmentVariable("API_TOKEN")}");
-            HttpResponseMessage response = await _httpClient.SendAsync(request);
-
-            string contentType = response.Content.Headers.ContentType.MediaType;
-            string content = await response.Content.ReadAsStringAsync();
-
-            if (response.IsSuccessStatusCode)
+            if (urls == null || urls.Count == 0)
             {
-                _logger.LogInformation("Successful response from external API with content type: {ContentType}", contentType);
-            }
-            else
-            {
-                _logger.LogWarning("Failed response from external API with status code: {StatusCode}", response.StatusCode);
+                return BadRequest("Please provide at least one URL to fetch documents.");
             }
 
-            if (contentType == "application/json")
+            var tasks = new List<Task<HttpResponseMessage>>();
+
+            _logger.LogInformation("Starting to fetch {Count} documents concurrently.", urls.Count);
+
+            foreach (var url in urls)
             {
-                _logger.LogInformation("Processing JSON response.");
-                return Ok(content);
+                _logger.LogInformation("Sending request to {Url}", url);
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Add("Authorization", $"Token {Environment.GetEnvironmentVariable("API_TOKEN")}");
+                tasks.Add(_httpClient.SendAsync(request));
             }
-            else if (contentType == "text/html")
+
+            var responses = await Task.WhenAll(tasks);
+
+            var results = new List<object>();
+
+            foreach (var response in responses)
             {
-                _logger.LogWarning("Received HTML response, parsing HTML.");
-                var parsedHtml = ParseHtml(content);
-                return Ok(parsedHtml);
+                string contentType = response.Content.Headers.ContentType.MediaType;
+                string content = await response.Content.ReadAsStringAsync();
+
+                if (response.IsSuccessStatusCode)
+                {
+                    _logger.LogInformation("Successful response from {Url} with content type: {ContentType}", response.RequestMessage.RequestUri, contentType);
+                }
+                else
+                {
+                    _logger.LogWarning("Failed response from {Url} with status code: {StatusCode}", response.RequestMessage.RequestUri, response.StatusCode);
+                }
+
+                if (contentType == "application/json")
+                {
+                    results.Add(new { Url = response.RequestMessage.RequestUri.ToString(), Content = content });
+                }
+                else if (contentType == "text/html")
+                {
+                    _logger.LogWarning("Received HTML response from {Url}, parsing HTML.", response.RequestMessage.RequestUri);
+                    var parsedHtml = ParseHtml(content);
+                    results.Add(new { Url = response.RequestMessage.RequestUri.ToString(), Content = parsedHtml });
+                }
+                else
+                {
+                    _logger.LogError("Unexpected content type: {ContentType} from {Url}.", contentType, response.RequestMessage.RequestUri);
+                    results.Add(new { Url = response.RequestMessage.RequestUri.ToString(), Content = content });
+                }
             }
-            else
-            {
-                _logger.LogError("Unexpected content type: {ContentType}. Returning raw response.", contentType);
-                return StatusCode((int)response.StatusCode, content);
-            }
+
+            return Ok(results);
         }
 
         private string ParseHtml(string htmlContent)
